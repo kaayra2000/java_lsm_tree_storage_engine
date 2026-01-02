@@ -1,0 +1,17 @@
+# Bytecode ve Derleme Çıktıları
+bin/
+target/
+*.class
+
+# Veritabanı ve Çalışma Zamanı Verileri
+data/
+*.wal
+*.sst
+MANIFEST
+
+# IDE ve İşletim Sistemi Dosyaları
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.log
