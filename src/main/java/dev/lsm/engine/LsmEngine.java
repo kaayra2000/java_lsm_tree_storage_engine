@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -28,10 +29,19 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
+/**
+ * LSM-Tree (Log-Structured Merge-Tree) Ana Depolama Motoru.
+ * Yüksek yazma verimi, bellek içi SkipList MemTable, çökme toleranslı WAL,
+ * Bloom Filtreli SSTable dosya blokları ve arka plan Seviyeli Birleştirme (Compaction)
+ * yeteneklerini tek bir çatı altında birleştirir.
+ */
 public final class LsmEngine implements AutoCloseable {
+
     private static final Logger LOGGER = Logger.getLogger(LsmEngine.class.getName());
+
     private final LsmConfig config;
     private final BlockCache blockCache;
     private final ManifestManager manifestManager;
@@ -39,11 +49,14 @@ public final class LsmEngine implements AutoCloseable {
     private final Compactor compactor;
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+
     private final AtomicLong nextSequenceNumber = new AtomicLong(0);
 
+    // Bellek İçi Yapılar
     private volatile MemTable activeMemTable;
     private volatile MemTableSnapshot immutableMemTable;
 
+    // Telemetri / Metrikler
     private final AtomicLong totalPuts = new AtomicLong(0);
     private final AtomicLong totalGets = new AtomicLong(0);
     private final AtomicLong totalDeletes = new AtomicLong(0);
@@ -60,15 +73,30 @@ public final class LsmEngine implements AutoCloseable {
         BlockCache blockCache = new BlockCache(config.blockCacheCapacity());
         ManifestManager manifestManager = new ManifestManager(config.dbPath());
         WalManager walManager = new WalManager(walDir, config.syncWalOnWrite());
-        CompactionStrategy strategy = new CompactionStrategy(config.l0CompactionThreshold(), config.l1BaseBytes(), config.levelSizeMultiplier());
-        Compactor compactor = new Compactor(config.dbPath(), manifestManager, strategy, blockCache, config.targetBlockSize(), config.bloomFpp(), config.sstableTargetSizeBytes());
+
+        CompactionStrategy strategy = new CompactionStrategy(
+                config.l0CompactionThreshold(),
+                config.l1BaseBytes(),
+                config.levelSizeMultiplier()
+        );
+
+        Compactor compactor = new Compactor(
+                config.dbPath(),
+                manifestManager,
+                strategy,
+                blockCache,
+                config.targetBlockSize(),
+                config.bloomFpp(),
+                config.sstableTargetSizeBytes()
+        );
 
         LsmEngine engine = new LsmEngine(config, blockCache, manifestManager, walManager, compactor);
         engine.recover();
         return engine;
     }
 
-    private LsmEngine(LsmConfig config, BlockCache blockCache, ManifestManager manifestManager, WalManager walManager, Compactor compactor) {
+    private LsmEngine(LsmConfig config, BlockCache blockCache, ManifestManager manifestManager,
+                      WalManager walManager, Compactor compactor) {
         this.config = config;
         this.blockCache = blockCache;
         this.manifestManager = manifestManager;
@@ -76,32 +104,50 @@ public final class LsmEngine implements AutoCloseable {
         this.compactor = compactor;
     }
 
+    /**
+     * Başlangıçta mevcut WAL kütüklerini okuyarak belleğe yeniden yükler.
+     */
     private void recover() throws IOException {
         long currentWalId = walManager.getCurrentWalId();
         if (currentWalId == 0) {
             walManager.rotate();
             currentWalId = walManager.getCurrentWalId();
         }
+
         this.activeMemTable = new MemTable(currentWalId);
+
         List<KeyValueRecord> recoveredRecords = walManager.recoverAll();
         long maxSeq = manifestManager.getLastSequenceNumber();
+
         for (KeyValueRecord record : recoveredRecords) {
             activeMemTable.put(record);
-            if (record.sequenceNumber() > maxSeq) maxSeq = record.sequenceNumber();
+            if (record.sequenceNumber() > maxSeq) {
+                maxSeq = record.sequenceNumber();
+            }
         }
+
         nextSequenceNumber.set(maxSeq);
         manifestManager.setLastSequenceNumber(maxSeq);
+
+        LOGGER.info(String.format("LSM Motoru başlatıldı. Kurtarılan kayıt: %d, Son Seq: %d",
+                recoveredRecords.size(), maxSeq));
     }
 
+    /**
+     * Veritabanına yeni bir anahtar-değer çifti yazar (PUT).
+     */
     public void put(byte[] key, byte[] value) throws IOException {
         ensureOpen();
         totalPuts.incrementAndGet();
+
         long seq = nextSequenceNumber.incrementAndGet();
         KeyValueRecord record = KeyValueRecord.put(key, value, seq);
+
         rwLock.writeLock().lock();
         try {
             walManager.append(record);
             activeMemTable.put(record);
+
             if (activeMemTable.getByteSize() >= config.memTableThresholdBytes()) {
                 triggerMemTableFlush();
             }
@@ -114,54 +160,86 @@ public final class LsmEngine implements AutoCloseable {
         put(ByteUtils.toBytes(key), ByteUtils.toBytes(value));
     }
 
+    /**
+     * Anahtara karşılık gelen değeri sorgular (GET).
+     */
     public Optional<byte[]> get(byte[] key) throws IOException {
         ensureOpen();
         totalGets.incrementAndGet();
-        rwLock.readLock().lock();
-        try {
-            MemTable currentMem = activeMemTable;
-            KeyValueRecord record = currentMem.get(key);
+
+        // 1. Aktif MemTable Kontrolü
+        MemTable currentMem = activeMemTable;
+        KeyValueRecord record = currentMem.get(key);
+        if (record != null) {
+            memTableHits.incrementAndGet();
+            return record.isTombstone() ? Optional.empty() : Optional.of(record.value());
+        }
+
+        // 2. Dondurulmuş MemTable Kontrolü
+        MemTableSnapshot imm = immutableMemTable;
+        if (imm != null) {
+            record = imm.get(key);
             if (record != null) {
-                memTableHits.incrementAndGet();
+                immutableHits.incrementAndGet();
                 return record.isTombstone() ? Optional.empty() : Optional.of(record.value());
             }
+        }
 
-            MemTableSnapshot imm = immutableMemTable;
-            if (imm != null) {
-                record = imm.get(key);
-                if (record != null) {
-                    immutableHits.incrementAndGet();
-                    return record.isTombstone() ? Optional.empty() : Optional.of(record.value());
-                }
-            }
-
-            Version version = manifestManager.getCurrentVersion();
-            for (FileMetaData fileMeta : version.getFilesAtLevel(0)) {
+        // 3. Disk SSTable Seviyeleri Kontrolü
+        Version version = manifestManager.getCurrentVersion();
+        version.retain();
+        try {
+            // Level 0: Dosyalar çakışabilir, en yeniden en eskiye taranır
+            List<FileMetaData> l0Files = version.getFilesAtLevel(0);
+            for (int i = l0Files.size() - 1; i >= 0; i--) {
+                FileMetaData fileMeta = l0Files.get(i);
                 record = searchInSSTable(fileMeta, key);
                 if (record != null) {
                     sstableHits.incrementAndGet();
                     return record.isTombstone() ? Optional.empty() : Optional.of(record.value());
                 }
             }
-            return Optional.empty();
+
+            // Level 1 .. Level MAX: Dosyalar sıralı ve ayrıktır (non-overlapping)
+            for (int lvl = 1; lvl < Version.MAX_LEVELS; lvl++) {
+                List<FileMetaData> levelFiles = version.getFilesAtLevel(lvl);
+                if (levelFiles.isEmpty()) continue;
+
+                FileMetaData targetFile = findCandidateFileInLevel(levelFiles, key);
+                if (targetFile != null) {
+                    record = searchInSSTable(targetFile, key);
+                    if (record != null) {
+                        sstableHits.incrementAndGet();
+                        return record.isTombstone() ? Optional.empty() : Optional.of(record.value());
+                    }
+                }
+            }
         } finally {
-            rwLock.readLock().unlock();
+            version.release();
         }
+
+        return Optional.empty();
     }
 
     public Optional<String> get(String key) throws IOException {
         return get(ByteUtils.toBytes(key)).map(ByteUtils::toString);
     }
 
+    /**
+     * Anahtarı veritabanından siler (Tombstone yazar).
+     */
     public void delete(byte[] key) throws IOException {
         ensureOpen();
         totalDeletes.incrementAndGet();
+
         long seq = nextSequenceNumber.incrementAndGet();
         KeyValueRecord record = KeyValueRecord.delete(key, seq);
+
         rwLock.writeLock().lock();
         try {
             walManager.append(record);
             activeMemTable.put(record);
+
             if (activeMemTable.getByteSize() >= config.memTableThresholdBytes()) {
                 triggerMemTableFlush();
             }
@@ -170,13 +248,110 @@ public final class LsmEngine implements AutoCloseable {
         }
     }
 
-    public void delete(String key) throws IOException { delete(ByteUtils.toBytes(key)); }
+    public void delete(String key) throws IOException {
+        delete(ByteUtils.toBytes(key));
+    }
 
+    public boolean contains(byte[] key) throws IOException {
+        return get(key).isPresent();
+    }
+
+    public boolean contains(String key) throws IOException {
+        return contains(ByteUtils.toBytes(key));
+    }
+
+    /**
+     * [startKey, endKey) aralığındaki tüm kayıtları sıralı bir şekilde tarar.
+     */
+    public Iterator<Entry> scan(byte[] startKey, byte[] endKey) throws IOException {
+        ensureOpen();
+
+        List<Iterator<KeyValueRecord>> iterators = new ArrayList<>();
+
+        // MemTable yineleyicileri
+        iterators.add(activeMemTable.range(startKey, endKey));
+        if (immutableMemTable != null) {
+            iterators.add(immutableMemTable.range(startKey, endKey));
+        }
+
+        // SSTable yineleyicileri
+        Version version = manifestManager.getCurrentVersion();
+        version.retain();
+
+        List<SSTableReader> openedReaders = new ArrayList<>();
+        for (FileMetaData f : version.getAllFiles()) {
+            if (f.overlapsWith(startKey, endKey)) {
+                Path sstPath = config.dbPath().resolve(String.format("table-%08d.sst", f.sstableId()));
+                if (Files.exists(sstPath)) {
+                    SSTableReader r = SSTableReader.open(f.sstableId(), sstPath, blockCache);
+                    openedReaders.add(r);
+                    iterators.add(r.iterator());
+                }
+            }
+        }
+
+        MergingIterator merged = new MergingIterator(iterators, false);
+
+        return new Iterator<>() {
+            private Entry nextEntry = null;
+
+            {
+                advance();
+            }
+
+            private void advance() {
+                nextEntry = null;
+                while (merged.hasNext()) {
+                    KeyValueRecord rec = merged.next();
+                    // Aralık denetimi
+                    if (startKey != null && ByteUtils.compare(rec.key(), startKey) < 0) {
+                        continue;
+                    }
+                    if (endKey != null && ByteUtils.compare(rec.key(), endKey) >= 0) {
+                        break;
+                    }
+                    if (!rec.isTombstone()) {
+                        nextEntry = new Entry(rec.key(), rec.value());
+                        break;
+                    }
+                }
+
+                if (nextEntry == null) {
+                    // Kaynakları temizle
+                    for (SSTableReader r : openedReaders) {
+                        try {
+                            r.close();
+                        } catch (Exception ignored) {}
+                    }
+                    version.release();
+                }
+            }
+
+            @Override
+            public boolean hasNext() {
+                return nextEntry != null;
+            }
+
+            @Override
+            public Entry next() {
+                if (!hasNext()) throw new NoSuchElementException();
+                Entry current = nextEntry;
+                advance();
+                return current;
+            }
+        };
+    }
+
+    /**
+     * MemTable'ı diske (Level 0 SSTable) boşaltır (Flush).
+     */
     public synchronized void flush() throws IOException {
         ensureOpen();
         rwLock.writeLock().lock();
         try {
-            if (activeMemTable.isEmpty()) return;
+            if (activeMemTable.isEmpty()) {
+                return;
+            }
             triggerMemTableFlush();
         } finally {
             rwLock.writeLock().unlock();
@@ -185,73 +360,135 @@ public final class LsmEngine implements AutoCloseable {
 
     private void triggerMemTableFlush() throws IOException {
         if (activeMemTable.isEmpty()) return;
+
         immutableMemTable = activeMemTable.freeze();
         walManager.rotate();
         this.activeMemTable = new MemTable(walManager.getCurrentWalId());
 
+        // Snapshot'ı diske yaz
         long newSstId = manifestManager.getNextSstableId();
         Path sstPath = config.dbPath().resolve(String.format("table-%08d.sst", newSstId));
-        SSTableWriter writer = new SSTableWriter(sstPath, newSstId, config.targetBlockSize(), config.bloomFpp());
-        SSTableWriter.SSTableSummary summary = writer.write(immutableMemTable.iterator(), (int) immutableMemTable.getRecordCount());
+
+        SSTableWriter writer = new SSTableWriter(
+                sstPath,
+                newSstId,
+                config.targetBlockSize(),
+                config.bloomFpp()
+        );
+
+        SSTableWriter.SSTableSummary summary = writer.write(
+                immutableMemTable.iterator(),
+                (int) immutableMemTable.getRecordCount()
+        );
+
         if (summary.recordCount() > 0) {
             long fileSize = Files.size(sstPath);
-            FileMetaData meta = new FileMetaData(newSstId, 0, fileSize, summary.firstKey(), summary.lastKey(), summary.minSeqNum(), summary.maxSeqNum());
+            FileMetaData meta = new FileMetaData(
+                    newSstId,
+                    0, // L0 seviyesine eklenir
+                    fileSize,
+                    summary.firstKey(),
+                    summary.lastKey(),
+                    summary.minSeqNum(),
+                    summary.maxSeqNum()
+            );
+
             VersionEdit edit = new VersionEdit();
             edit.addFile(meta);
             manifestManager.logAndApply(edit);
         }
+
+        // Temizlenen WAL kütüğünü sil
         walManager.purgeWalsBefore(immutableMemTable.getWalId());
         immutableMemTable = null;
+
+        // Arka plan compaction çalışmasını tetikle
         compactor.trigger();
     }
 
+    /**
+     * Elle tek seferlik veya tam Compaction çalıştırır.
+     */
     public synchronized void compact() throws IOException {
         ensureOpen();
-        while (compactor.performOneCompaction()) {}
+        while (compactor.performOneCompaction()) {
+            // Tamamlanana kadar devam et
+        }
     }
 
     private KeyValueRecord searchInSSTable(FileMetaData meta, byte[] key) throws IOException {
         Path path = config.dbPath().resolve(String.format("table-%08d.sst", meta.sstableId()));
         if (!Files.exists(path)) return null;
+
         try (SSTableReader reader = SSTableReader.open(meta.sstableId(), path, blockCache)) {
-            return reader.get(key);
+            KeyValueRecord record = reader.get(key);
+            if (record == null && !reader.getBloomFilter().mightContain(key)) {
+                bloomFilterBypasses.incrementAndGet();
+            }
+            return record;
         }
     }
 
-    public boolean contains(byte[] key) throws IOException { return get(key).isPresent(); }
-    public boolean contains(String key) throws IOException { return contains(ByteUtils.toBytes(key)); }
+    private FileMetaData findCandidateFileInLevel(List<FileMetaData> files, byte[] key) {
+        int low = 0;
+        int high = files.size() - 1;
 
-    public Iterator<Entry> scan(byte[] startKey, byte[] endKey) throws IOException {
-        ensureOpen();
-        List<Iterator<KeyValueRecord>> iterators = new ArrayList<>();
-        iterators.add(activeMemTable.range(startKey, endKey));
-        if (immutableMemTable != null) iterators.add(immutableMemTable.range(startKey, endKey));
-        MergingIterator merged = new MergingIterator(iterators, false);
-        return new Iterator<>() {
-            @Override public boolean hasNext() { return merged.hasNext(); }
-            @Override public Entry next() {
-                KeyValueRecord r = merged.next();
-                return new Entry(r.key(), r.value());
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            FileMetaData meta = files.get(mid);
+            if (ByteUtils.compare(key, meta.firstKey()) < 0) {
+                high = mid - 1;
+            } else if (ByteUtils.compare(key, meta.lastKey()) > 0) {
+                low = mid + 1;
+            } else {
+                return meta; // Aralık içerisinde
             }
-        };
+        }
+        return null;
     }
 
     public EngineStats getStats() {
-        return new EngineStats(totalPuts.get(), totalGets.get(), totalDeletes.get(), memTableHits.get(), immutableHits.get(), sstableHits.get(), bloomFilterBypasses.get(), blockCache.getHits(), blockCache.getMisses(), blockCache.getHitRate(), activeMemTable.getByteSize(), activeMemTable.getRecordCount(), 0, 0);
+        Version v = manifestManager.getCurrentVersion();
+        List<FileMetaData> files = v.getAllFiles();
+        long totalSstBytes = 0;
+        for (FileMetaData f : files) totalSstBytes += f.fileSize();
+
+        return new EngineStats(
+                totalPuts.get(),
+                totalGets.get(),
+                totalDeletes.get(),
+                memTableHits.get(),
+                immutableHits.get(),
+                sstableHits.get(),
+                bloomFilterBypasses.get(),
+                blockCache.getHits(),
+                blockCache.getMisses(),
+                blockCache.getHitRate(),
+                activeMemTable.getByteSize(),
+                activeMemTable.getRecordCount(),
+                files.size(),
+                totalSstBytes
+        );
     }
 
     private void ensureOpen() {
-        if (closed.get()) throw new IllegalStateException("LSM Depolama Motoru kapalıdır!");
+        if (closed.get()) {
+            throw new IllegalStateException("LSM Depolama Motoru kapalıdır!");
+        }
     }
 
     @Override
     public synchronized void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
-            if (activeMemTable != null && !activeMemTable.isEmpty()) triggerMemTableFlush();
+            LOGGER.info("LSM Depolama Motoru kapatılıyor...");
+            if (activeMemTable != null && !activeMemTable.isEmpty()) {
+                triggerMemTableFlush();
+            }
             compactor.close();
             walManager.close();
             manifestManager.close();
             blockCache.clear();
+            LOGGER.info("LSM Depolama Motoru başarıyla kapatıldı.");
         }
     }
 }
